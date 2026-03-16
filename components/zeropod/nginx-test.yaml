@@ -1,0 +1,19 @@
+# Simple nginx pod to validate ZeroPod checkpoint/restore
+# Deploy:  kubectl apply -f nginx-test.yaml
+# Test:    curl <pod-ip>:80  →  wait 30s  →  curl again (should restore)
+# Delete:  kubectl delete -f nginx-test.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-test
+  annotations:
+    zeropod.ctrox.dev/container-names: "nginx"
+    zeropod.ctrox.dev/ports-map: "nginx=80"
+    zeropod.ctrox.dev/scaledown-duration: "30s"
+spec:
+  runtimeClassName: zeropod
+  containers:
+  - name: nginx
+    image: nginx:alpine
+    ports:
+    - containerPort: 80
