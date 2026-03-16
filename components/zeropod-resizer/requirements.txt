@@ -1,0 +1,2 @@
+kopf>=1.37,<2.0
+kubernetes>=33.0  # K8s 1.33+ required for KEP-1287 in-place pod resize (/resize subresource)

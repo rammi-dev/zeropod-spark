@@ -1,15 +1,8 @@
-# Phase 2: ZeroPod resource resizer controller
-# TODO: implement controller.py first, build and push Docker image
+# ZeroPod Resource Resizer Controller
+# Uses kopf framework to watch pods and resize on checkpoint/restore
 #
-# This is a placeholder — the controller watches ZeroPod checkpoint/restore
-# events and resizes pod resource requests using KEP-1287 in-place resize.
-#
-# Prerequisites:
-#   - K8s 1.33+ (in-place resize Beta)
-#   - ZeroPod installed
-#   - Pods with resizePolicy: NotRequired
-
-# Placeholder deployment - update image after building controller
+# Build:   docker build -t zeropod-resizer:latest components/zeropod-resizer/
+# Deploy:  kubectl apply -f components/zeropod-resizer/deploy.yaml
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -22,12 +15,22 @@ kind: ClusterRole
 metadata:
   name: zeropod-resizer
 rules:
+# Pod read/watch/patch for annotation and resize
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "watch", "patch"]
+# In-place resize subresource (KEP-1287)
 - apiGroups: [""]
   resources: ["pods/resize"]
   verbs: ["patch"]
+# Events for kopf status reporting
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create"]
+# kopf leader election
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -41,26 +44,36 @@ roleRef:
   kind: ClusterRole
   name: zeropod-resizer
   apiGroup: rbac.authorization.k8s.io
-# ---
-# apiVersion: apps/v1
-# kind: Deployment
-# metadata:
-#   name: zeropod-resizer
-#   namespace: zeropod-system
-# spec:
-#   replicas: 1
-#   selector:
-#     matchLabels:
-#       app: zeropod-resizer
-#   template:
-#     metadata:
-#       labels:
-#         app: zeropod-resizer
-#     spec:
-#       serviceAccountName: zeropod-resizer
-#       containers:
-#       - name: resizer
-#         image: zeropod-resizer:latest  # TODO: build and push
-#         env:
-#         - name: WATCH_NAMESPACE
-#           value: "spark-workload"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zeropod-resizer
+  namespace: zeropod-system
+  labels:
+    app: zeropod-resizer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zeropod-resizer
+  template:
+    metadata:
+      labels:
+        app: zeropod-resizer
+    spec:
+      serviceAccountName: zeropod-resizer
+      containers:
+      - name: resizer
+        image: zeropod-resizer:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: WATCH_NAMESPACE
+          value: "spark-workload"
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
