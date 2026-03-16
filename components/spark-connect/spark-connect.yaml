@@ -1,0 +1,59 @@
+# Spark Connect server with ZeroPod checkpoint/restore
+#
+# Deploy:  kubectl apply -f spark-connect.yaml
+# Connect: sc://spark-connect-server-svc.spark-workload:15002
+# Web UI:  spark-connect-server-svc.spark-workload:4040
+# Delete:  kubectl delete -f spark-connect.yaml
+apiVersion: spark.apache.org/v1
+kind: SparkApplication
+metadata:
+  name: spark-connect-server
+  namespace: spark-workload
+spec:
+  mainClass: org.apache.spark.sql.connect.service.SparkConnectServer
+
+  runtimeVersions:
+    sparkVersion: "4.1.1"
+
+  sparkConf:
+    # Dynamic allocation — executors scale to zero when idle
+    spark.dynamicAllocation.enabled: "true"
+    spark.dynamicAllocation.shuffleTracking.enabled: "true"
+    spark.dynamicAllocation.minExecutors: "0"
+    spark.dynamicAllocation.maxExecutors: "2"
+    spark.dynamicAllocation.executorIdleTimeout: "60s"
+    # K8s pod identity
+    spark.kubernetes.authenticate.driver.serviceAccountName: spark
+    spark.kubernetes.container.image: apache/spark:4.1.1
+    spark.kubernetes.executor.podNamePrefix: spark-connect-server
+    # Fair scheduling for concurrent sessions
+    spark.scheduler.mode: FAIR
+
+  applicationTolerations:
+    resourceRetainPolicy: Always
+    restartConfig:
+      restartPolicy: OnFailure
+      maxRestartAttempts: 3
+
+  driverSpec:
+    podTemplateSpec:
+      metadata:
+        annotations:
+          # ZeroPod: checkpoint driver after 5 min idle on gRPC port
+          zeropod.ctrox.dev/container-names: "spark-kubernetes-driver"
+          zeropod.ctrox.dev/ports-map: "spark-kubernetes-driver=15002"
+          zeropod.ctrox.dev/scaledown-duration: "5m"
+      spec:
+        runtimeClassName: zeropod
+        serviceAccountName: spark
+
+  driverServiceIngressList:
+    - serviceSpec:
+        type: ClusterIP
+        ports:
+          - name: spark-connect
+            port: 15002
+            targetPort: 15002
+          - name: web-ui
+            port: 4040
+            targetPort: 4040
