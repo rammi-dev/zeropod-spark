@@ -15,6 +15,20 @@ Write-Host "  Disk: $DISK_SIZE"
 Write-Host "  K8s: $K8S_VERSION"
 Write-Host ""
 
+# Check for custom ISO with CRIU support
+$isoArgs = @()
+$isoPath = Join-Path $PSScriptRoot "..\minikube-x86_64.iso"
+if (Test-Path $isoPath) {
+    $isoFull = (Resolve-Path $isoPath).Path -replace '\\','/'
+    $isoArgs = @("--iso-url=file:///$isoFull")
+    Write-Host "  ISO: $isoFull (custom, CRIU-enabled)" -ForegroundColor Cyan
+} else {
+    Write-Host "  ISO: default (no custom ISO found)" -ForegroundColor Yellow
+    Write-Host "  [WARN] Default ISO may lack CONFIG_CHECKPOINT_RESTORE" -ForegroundColor Yellow
+    Write-Host "  See scripts/build-minikube-iso.md for build instructions" -ForegroundColor Yellow
+}
+Write-Host ""
+
 # Create cluster with containerd runtime
 Write-Host "[INFO] Creating minikube cluster with containerd..." -ForegroundColor Yellow
 & $MINIKUBE_EXE start `
@@ -28,7 +42,8 @@ Write-Host "[INFO] Creating minikube cluster with containerd..." -ForegroundColo
     --disk-size=$DISK_SIZE `
     --kubernetes-version=$K8S_VERSION `
     --extra-config=kubelet.housekeeping-interval=10s `
-    --extra-config=kubelet.fail-swap-on=false
+    --extra-config=kubelet.fail-swap-on=false `
+    @isoArgs
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] Minikube failed to start" -ForegroundColor Red
@@ -44,7 +59,7 @@ Write-Host ""
 Write-Host "[INFO] Verifying containerd runtime..." -ForegroundColor Yellow
 & $MINIKUBE_EXE -p $PROFILE ssh -- "sudo crictl info | head -5"
 
-# Test IPv6 — only apply fix if needed
+# Test IPv6 -- only apply fix if needed
 Write-Host ""
 $pullOk = Test-IPv6Pull -ProfileName $PROFILE
 if (-not $pullOk) {
@@ -64,10 +79,14 @@ if (-not $pullOk) {
 # Check CRIU kernel support
 Write-Host ""
 Write-Host "[INFO] Checking CRIU kernel support..." -ForegroundColor Yellow
-& $MINIKUBE_EXE -p $PROFILE ssh -- "zgrep CONFIG_CHECKPOINT_RESTORE /proc/config.gz"
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "[ERROR] Kernel lacks CONFIG_CHECKPOINT_RESTORE — cannot use CRIU/ZeroPod" -ForegroundColor Red
-    Write-Host "[INFO] You may need a custom minikube ISO with CRIU support" -ForegroundColor Yellow
+$criuCheck = & $MINIKUBE_EXE -p $PROFILE ssh -- "zgrep CONFIG_CHECKPOINT_RESTORE /proc/config.gz"
+Write-Host "  $criuCheck"
+if ($criuCheck -notmatch '=y') {
+    Write-Host "[ERROR] Kernel lacks CONFIG_CHECKPOINT_RESTORE=y -- cannot use CRIU/ZeroPod" -ForegroundColor Red
+    Write-Host "[INFO] Options:" -ForegroundColor Yellow
+    Write-Host "  - Custom minikube ISO with CRIU-enabled kernel"
+    Write-Host "  - Use --iso-url with a kernel that has CRIU support"
+    Write-Host "  - Use a different VM/driver with a full distro kernel"
     exit 1
 }
 

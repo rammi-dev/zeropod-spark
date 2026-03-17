@@ -21,11 +21,11 @@ function Test-IPv6Pull {
     Write-Host "[INFO] Testing if image pull works without IPv6 fix..." -ForegroundColor Yellow
     & $MINIKUBE_EXE -p $ProfileName ssh -- "sudo crictl pull nginx:alpine" 2>$null
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "[SUCCESS] Image pull works — no IPv6 fix needed" -ForegroundColor Green
+        Write-Host "[SUCCESS] Image pull works -- no IPv6 fix needed" -ForegroundColor Green
         & $MINIKUBE_EXE -p $ProfileName ssh -- "sudo crictl rmi nginx:alpine" 2>$null
         return $true
     } else {
-        Write-Host "[INFO] Image pull failed — applying IPv6 fix" -ForegroundColor Yellow
+        Write-Host "[INFO] Image pull failed -- applying IPv6 fix" -ForegroundColor Yellow
         return $false
     }
 }
@@ -39,7 +39,7 @@ function Fix-IPv6Routing {
     EADDRNOTAVAIL because the network has no IPv6 routing. Go does NOT fall back to IPv4.
 
     Fix: Enable IPv6 with a dummy address and default route so packets reach ip6tables,
-    then REJECT all IPv6 TCP — Go gets ECONNREFUSED which triggers proper IPv4 fallback.
+    then REJECT all IPv6 TCP -- Go gets ECONNREFUSED which triggers proper IPv4 fallback.
     Finally restart containerd so Go re-probes IPv6 availability.
 
     Must be re-applied after every minikube start (root fs is tmpfs).
