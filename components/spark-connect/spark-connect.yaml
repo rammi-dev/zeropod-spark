@@ -48,7 +48,13 @@ spec:
         serviceAccountName: spark
 
   driverServiceIngressList:
-    - serviceSpec:
+    - serviceMetadata:
+        name: spark-connect-server-svc
+        namespace: spark-workload
+      ingressMetadata:
+        name: spark-connect-server-ingress
+        namespace: spark-workload
+      serviceSpec:
         type: ClusterIP
         ports:
           - name: spark-connect

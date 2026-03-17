@@ -11,15 +11,8 @@ echo "[INFO] Installing Spark operator..."
 helm install spark-operator spark-operator/spark-kubernetes-operator \
   --namespace spark-operator \
   --create-namespace \
+  --set "workloadResources.namespaces.data={spark-workload}" \
   --wait
-
-echo "[INFO] Creating Spark workload namespace and RBAC..."
-kubectl create namespace spark-workload --dry-run=client -o yaml | kubectl apply -f -
-kubectl create serviceaccount spark -n spark-workload --dry-run=client -o yaml | kubectl apply -f -
-kubectl create clusterrolebinding spark-role \
-  --clusterrole=edit \
-  --serviceaccount=spark-workload:spark \
-  --dry-run=client -o yaml | kubectl apply -f -
 
 echo ""
 echo "[INFO] Spark operator pods:"

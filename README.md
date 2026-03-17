@@ -10,8 +10,7 @@ Spark Connect runs a long-lived driver pod (2-8GB RAM) that sits idle between qu
 |----------|-----------|---------------------|
 | Always-on driver | 0ms | Full (2-8GB wasted) |
 | KEDA scale 0→1 | 30-60s (cold start) | Zero |
-| **ZeroPod (this POC)** | **~400ms** | **Pod reserved, process frozen** |
-| ZeroPod + resizer (Phase 2) | ~400ms | Near-zero |
+| **ZeroPod (this POC)** | **~400ms** | **Near-zero (in-place resize built-in)** |
 
 ## Architecture
 
@@ -71,25 +70,22 @@ Spark Connect runs a long-lived driver pod (2-8GB RAM) that sits idle between qu
   7. Spark processes query normally
 
 
-                                    Phase 2: Resource Resize
+                                    In-Place Resource Resize
                                     ────────────────────────
 
-  ┌──────────────────────────────────────────────────────────────────┐
-  │  ZeroPod Resizer Controller                                      │
-  │  (watches checkpoint/restore events)                             │
-  │                                                                  │
-  │  On checkpoint:                                                  │
-  │    1. Save original requests as pod annotation                   │
-  │    2. Patch pod requests → {cpu: 1m, memory: 1Mi}               │
-  │    3. Scheduler sees freed capacity                              │
-  │                                                                  │
-  │  On restore:                                                     │
-  │    1. Read original requests from annotation                     │
-  │    2. Patch pod requests → {cpu: 2, memory: 4Gi}                │
-  │    3. Scheduler reserves capacity again                          │
-  │                                                                  │
-  │  Uses KEP-1287 In-Place Pod Vertical Scaling (K8s 1.33+ Beta)   │
-  └──────────────────────────────────────────────────────────────────┘
+  ZeroPod's --in-place-scaling=true handles resource resize natively
+  using KEP-1287 In-Place Pod Vertical Scaling (K8s 1.33+ Beta):
+
+  On checkpoint:
+    1. Saves original requests as pod annotations
+       (zeropod.ctrox.dev/cpu-requests, zeropod.ctrox.dev/memory-requests)
+    2. Resizes pod requests → {cpu: 1m, memory: 1Ki}
+    3. Sets label: status.zeropod.ctrox.dev/<container>=SCALED_DOWN
+
+  On restore:
+    1. Reads original requests from annotations
+    2. Resizes pod requests back to original values
+    3. Sets label: status.zeropod.ctrox.dev/<container>=RUNNING
 
   Resource timeline:
   ══════════════════
@@ -102,10 +98,7 @@ Spark Connect runs a long-lived driver pod (2-8GB RAM) that sits idle between qu
            ◄──── active ────►◄── frozen ──►◄── active ──►◄ frozen
 
   ████ = actual usage (high)     ░░░░ = actual usage (zero)
-  ████ = scheduler request (high) ▓▓▓▓ = scheduler request (near-zero, Phase 2)
-
-  Without Phase 2: scheduler request stays ████ even while frozen
-  With Phase 2:    scheduler request drops to ▓▓▓▓ while frozen
+  ████ = scheduler request (high) ▓▓▓▓ = scheduler request (near-zero)
 ```
 
 ## Executor Lifecycle
@@ -170,8 +163,6 @@ bash tests/phase1.sh
 # Run individual test
 bash tests/phase1.sh 1.4    # nginx checkpoint/restore only
 
-# Phase 2: Resource resize (after controller implemented)
-bash tests/phase2.sh
 ```
 
 ### Phase 1 Tests
@@ -185,16 +176,6 @@ bash tests/phase2.sh
 | 1.5 | Spark operator ready | ~30s |
 | 1.6 | Spark Connect serves queries | ~5min (first pull) |
 | 1.7 | Spark Connect checkpoint/restore | ~6min (wait for idle) |
-
-### Phase 2 Tests
-
-| Test | Description | Duration |
-|------|-------------|----------|
-| 2.1 | In-place resize without restart | ~20s |
-| 2.2 | Resizer detects checkpoint → resize down | ~6min |
-| 2.3 | Scheduler sees freed capacity | instant |
-| 2.4 | Restore triggers resize up | ~6min |
-| 2.5 | Full end-to-end cycle | ~12min |
 
 ## Risk Checkpoints
 
@@ -225,59 +206,9 @@ zeropod-spark-poc/
 │   ├── spark-connect/
 │   │   ├── spark-connect.yaml  # SparkApplication + ZeroPod annotations
 │   │   └── test-query.py       # PySpark test client
-│   └── zeropod-resizer/        # Phase 2
-│       ├── controller.py       # kopf-based resize controller
-│       ├── requirements.txt    # kopf + kubernetes client
-│       ├── Dockerfile
-│       └── deploy.yaml         # RBAC + deployment
 └── tests/
-    ├── phase1.sh               # 7 tests
-    └── phase2.sh               # 5 tests
+    └── phase1.sh               # 7 tests
 ```
-
-## Phase 2: Resizer Controller
-
-### Framework: kopf (Kubernetes Operator Pythonic Framework)
-
-The resizer controller uses [kopf](https://kopf.readthedocs.io/) — a Python framework
-for building Kubernetes controllers without boilerplate.
-
-| Framework | Language | Why / Why not |
-|-----------|----------|---------------|
-| **kopf** (chosen) | Python | Simple controller (no CRDs), fast to prototype, `pip install kopf`, handles retries/leader election |
-| Kubebuilder | Go | Overkill — designed for full operators with CRDs, code generation, webhooks |
-| Operator SDK | Go/Ansible | Same as Kubebuilder, Red Hat wrapper |
-| controller-runtime | Go | Low-level, maximum control but most boilerplate |
-| metacontroller | Any (webhooks) | Declarative but adds another component to manage |
-
-### For production implementation
-
-If this POC validates the approach, a production controller would need:
-
-1. **Kubebuilder + Go** — for performance, type safety, and ecosystem alignment
-2. **Custom CRD** (`ZeroPodResizePolicy`) — declarative config per workload:
-   ```yaml
-   apiVersion: zeropod-resizer.dev/v1alpha1
-   kind: ResizePolicy
-   metadata:
-     name: spark-connect
-   spec:
-     targetRef:
-       kind: Pod
-       labelSelector:
-         matchLabels:
-           spark-app: spark-connect-server
-     frozenRequests:
-       cpu: 1m
-       memory: 1Mi
-     detectionMethod: annotation  # or: prometheus, polling
-   ```
-3. **Webhook integration** — mutating webhook to inject `resizePolicy: NotRequired`
-   into pods automatically
-4. **ZeroPod upstream PR** — add checkpoint/restore event annotations or webhooks
-   to ZeroPod itself, eliminating the need for polling/log scraping
-5. **Prometheus metrics** — expose resize events, latency, failures
-6. **Integration with VPA** — feed resize data into VerticalPodAutoscaler recommendations
 
 ## Key Decisions
 
@@ -286,5 +217,4 @@ If this POC validates the approach, a production controller would need:
 - **Apache Spark operator** — already have SparkApplication manifests
 - **Spark 4.1.1** — latest with Spark Connect support
 - **5 min idle timeout** for testing (30 min in production)
-- **Phase 2 separate** — validate CRIU + JVM first, then optimize resources
-- **kopf** for Phase 2 controller — fastest path to validate the resize approach
+- **No custom controller needed** — ZeroPod's `--in-place-scaling=true` handles resource resize natively via KEP-1287

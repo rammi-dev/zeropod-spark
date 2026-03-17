@@ -25,20 +25,26 @@ run_test() {
     echo "=== TEST $id: $name ==="
 }
 
-pass() { echo "  PASS"; ((PASS++)); }
-fail() { echo "  FAIL: $1"; ((FAIL++)); }
+pass() { echo "  PASS"; PASS=$((PASS + 1)); }
+fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 info() { echo "  INFO: $1"; }
+
+# Kill any existing port-forwards on 15002
+cleanup_port_forward() {
+    lsof -ti:15002 2>/dev/null | xargs kill 2>/dev/null || true
+}
 
 # --- Test 1.1: Containerd runtime ---
 run_test "1.1" "Containerd runtime is active"
 if [ "$FILTER" = "all" ] || [ "$FILTER" = "1.1" ]; then
-    minikube -p zeropod-poc ssh -- "crictl info" 2>/dev/null | grep -q "containerd" && pass || fail "containerd not running"
+    kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' 2>/dev/null | grep -q "containerd" && pass || fail "containerd not running"
 fi
 
 # --- Test 1.2: CRIU kernel support ---
 run_test "1.2" "Kernel CONFIG_CHECKPOINT_RESTORE enabled"
 if [ "$FILTER" = "all" ] || [ "$FILTER" = "1.2" ]; then
-    minikube -p zeropod-poc ssh -- "zgrep CONFIG_CHECKPOINT_RESTORE /proc/config.gz" 2>/dev/null | grep -q "=y" && pass || fail "kernel lacks CRIU support"
+    # Check via zeropod-node pod which has /hostproc mounted from the host
+    kubectl exec -n $ZEROPOD_NS daemonset/zeropod-node -c manager -- cat /hostproc/config.gz 2>/dev/null | zgrep -q "CONFIG_CHECKPOINT_RESTORE=y" && pass || fail "kernel lacks CRIU support"
 fi
 
 # --- Test 1.3: ZeroPod RuntimeClass exists ---
@@ -52,6 +58,7 @@ fi
 run_test "1.4" "Nginx checkpoint and restore"
 if [ "$FILTER" = "all" ] || [ "$FILTER" = "1.4" ]; then
     # Deploy
+    kubectl delete -f "$SCRIPT_DIR/components/zeropod/nginx-test.yaml" --ignore-not-found --wait=true 2>/dev/null
     kubectl apply -f "$SCRIPT_DIR/components/zeropod/nginx-test.yaml"
     kubectl wait --for=condition=Ready pod/nginx-test --timeout=60s
 
@@ -64,7 +71,7 @@ if [ "$FILTER" = "all" ] || [ "$FILTER" = "1.4" ]; then
     # 1.4b: Wait for checkpoint (30s scaledown + buffer)
     info "Waiting 45s for checkpoint..."
     sleep 45
-    if kubectl logs -n $ZEROPOD_NS -l app.kubernetes.io/name=zeropod --tail=30 2>/dev/null | grep -iq "checkpoint\|scaled down"; then
+    if kubectl logs -n $ZEROPOD_NS -l app.kubernetes.io/name=zeropod-node -c manager --tail=30 2>/dev/null | grep -q "SCALED_DOWN.*nginx-test"; then
         echo "  1.4b PASS: checkpoint detected in logs"
     else
         echo "  1.4b WARN: no checkpoint log found — check zeropod-system logs manually"
@@ -74,12 +81,12 @@ if [ "$FILTER" = "all" ] || [ "$FILTER" = "1.4" ]; then
     kubectl run curl-restore --rm -i --restart=Never --image=curlimages/curl -- curl -sf --max-time 10 "http://$NGINX_IP:80" > /dev/null 2>&1 && echo "  1.4c PASS: nginx restored" || echo "  1.4c FAIL: restore failed"
 
     # 1.4d: Restore time from logs
-    RESTORE_LOG=$(kubectl logs -n $ZEROPOD_NS -l app.kubernetes.io/name=zeropod --tail=50 2>/dev/null | grep -i "restore" | tail -1)
-    info "Restore log: $RESTORE_LOG"
+    RESTORE_DURATION=$(kubectl logs -n $ZEROPOD_NS -l app.kubernetes.io/name=zeropod-node -c manager --tail=50 2>/dev/null | grep "RUNNING.*nginx-test" | tail -1 | grep -oP '"duration":"\K[^"]+')
+    info "Restore duration: $RESTORE_DURATION"
 
     # Cleanup
     kubectl delete -f "$SCRIPT_DIR/components/zeropod/nginx-test.yaml" --wait=false
-    ((PASS++))
+    PASS=$((PASS + 1))
 fi
 
 # --- Test 1.5: Spark operator running ---
@@ -93,11 +100,12 @@ fi
 run_test "1.6" "Spark Connect responds to query"
 if [ "$FILTER" = "all" ] || [ "$FILTER" = "1.6" ]; then
     info "Waiting for Spark Connect driver..."
-    kubectl wait --for=condition=Ready pod -l spark-app=spark-connect-server -n $NAMESPACE --timeout=300s 2>/dev/null || {
+    kubectl wait --for=condition=Ready pod -l spark-role=driver -n $NAMESPACE --timeout=300s 2>/dev/null || {
         fail "driver pod not ready"
         kubectl get pods -n $NAMESPACE
     }
 
+    cleanup_port_forward
     kubectl port-forward svc/spark-connect-server-svc -n $NAMESPACE 15002:15002 &
     PF_PID=$!
     sleep 5
@@ -116,14 +124,15 @@ if [ "$FILTER" = "all" ] || [ "$FILTER" = "1.7" ]; then
     info "Waiting 5m30s for driver checkpoint (scaledown-duration=5m)..."
     sleep 330
 
-    if kubectl logs -n $ZEROPOD_NS -l app.kubernetes.io/name=zeropod --tail=50 2>/dev/null | grep -iq "checkpoint\|scaled down"; then
+    if kubectl logs -n $ZEROPOD_NS -l app.kubernetes.io/name=zeropod-node -c manager --tail=50 2>/dev/null | grep -q "SCALED_DOWN.*spark-connect"; then
         echo "  1.7a PASS: driver checkpointed"
     else
         echo "  1.7a FAIL: no checkpoint detected"
-        ((FAIL++))
+        FAIL=$((FAIL + 1))
     fi
 
     # Trigger restore with new query
+    cleanup_port_forward
     kubectl port-forward svc/spark-connect-server-svc -n $NAMESPACE 15002:15002 &
     PF_PID=$!
     sleep 5
@@ -138,6 +147,10 @@ if [ "$FILTER" = "all" ] || [ "$FILTER" = "1.7" ]; then
         fail "query after restore failed"
     fi
     kill $PF_PID 2>/dev/null || true
+
+    # Show restore duration from zeropod logs
+    RESTORE_DURATION=$(kubectl logs -n $ZEROPOD_NS -l app.kubernetes.io/name=zeropod-node -c manager --tail=20 2>/dev/null | grep "RUNNING.*spark-connect" | tail -1 | grep -oP '"duration":"\K[^"]+')
+    info "ZeroPod restore duration: $RESTORE_DURATION"
 fi
 
 # Summary
