@@ -12,6 +12,24 @@ Spark Connect runs a long-lived driver pod (2-8GB RAM) that sits idle between qu
 | KEDA scale 0→1 | 30-60s (cold start) | Zero |
 | **ZeroPod (this POC)** | **~400ms** | **Near-zero (in-place resize built-in)** |
 
+Where it makes sense
+
+Best use cases:
+
+✅ Dev / staging Spark
+
+Not used constantly
+
+Save resources
+
+✅ Interactive workloads
+
+Spark notebooks (Jupyter, Airflow-triggered jobs)
+
+✅ Low-frequency pipelines
+
+Triggered occasionally
+
 ## Architecture
 
 ```mermaid
