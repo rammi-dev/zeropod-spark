@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """Test DataFrame survival across ZeroPod checkpoint/restore.
 
-Simulates a notebook workflow:
-  1. Start Spark session, run a calculation, cache the DataFrame
-  2. Verify the DataFrame is usable
-  3. Wait for ZeroPod to scale down the driver (checkpoint)
-  4. Attempt to reuse the same DataFrame after restore
+Simulates a real notebook user: same Spark Connect session_id across
+checkpoint/restore. Run as K8s Jobs inside the cluster (no port-forward).
 
-Usage:
-  # Phase A — build DataFrame and verify:
-  python3 test-dataframe-survival.py prepare [endpoint]
+  1. `prepare` — connect, build cached DataFrame + temp view, print session_id
+  2. `resume <session_id>` — reconnect with SAME session_id, query temp view
 
-  # Phase B — reuse DataFrame after restore:
-  python3 test-dataframe-survival.py resume [endpoint]
+Between the two calls, the client pod exits (no TCP traffic to the driver),
+ZeroPod checkpoints the idle driver, then a new pod reconnects with the
+same session_id.
+
+The session_id can be passed via the Spark Connect URI:
+  sc://spark-connect-server-svc:15002/;session_id=<uuid>
+
+Security note: any client knowing a session_id can attach to that session.
+See docs/spark-connect-session-behavior.md for details.
 """
 import sys
 import time
@@ -22,129 +25,118 @@ try:
     from pyspark.sql import SparkSession
     from pyspark.sql import functions as F
 except ImportError:
-    print("ERROR: pyspark not installed. Run: pip install pyspark[connect]")
+    print("ERROR: pyspark not installed")
     sys.exit(1)
 
-STATE_FILE = "/tmp/spark-df-test-state.json"
-
-
-def get_session(endpoint):
-    print(f"Connecting to {endpoint}...")
-    start = time.time()
-    spark = SparkSession.builder \
-        .remote(endpoint) \
-        .getOrCreate()
-    elapsed = time.time() - start
-    print(f"Connected in {elapsed:.2f}s")
-    return spark
+EXPECTED_COUNT = 10000
+EXPECTED_SUM_SQUARED = 333383335000
+EXPECTED_BUCKETS = 10
+VIEW_NAME = "df_survival_test"
 
 
 def phase_prepare(endpoint):
-    """Build a DataFrame, cache it, and verify results."""
-    spark = get_session(endpoint)
+    """Build a DataFrame, cache it, create temp view, print session_id."""
+    print(f"Connecting to {endpoint}...")
+    t0 = time.time()
+    spark = SparkSession.builder.remote(endpoint).getOrCreate()
+    print(f"Connected in {time.time() - t0:.2f}s")
+    print(f"Session ID: {spark.session_id}")
 
     print("\n--- Preparing DataFrame ---")
-    start = time.time()
-
-    # Simulate a non-trivial calculation
-    df = spark.range(1, 10001) \
+    t0 = time.time()
+    df = spark.range(1, EXPECTED_COUNT + 1) \
         .withColumn("squared", F.col("id") * F.col("id")) \
         .withColumn("bucket", (F.col("id") % 10).cast("int"))
 
-    # Cache to Spark memory so the data persists in the driver/executors
     df.cache()
-
-    # Materialize the cache
     total_count = df.count()
-    bucket_counts = df.groupBy("bucket").count().orderBy("bucket")
-    bucket_rows = bucket_counts.collect()
+    bucket_rows = df.groupBy("bucket").count().orderBy("bucket").collect()
     sum_squared = df.agg(F.sum("squared")).collect()[0][0]
+    prep_time = time.time() - t0
 
-    prep_time = time.time() - start
-
-    print(f"Total rows:  {total_count} (expected 10000)")
-    print(f"Buckets:     {len(bucket_rows)} (expected 10)")
-    print(f"Sum squared: {sum_squared} (expected 333383335000)")
+    print(f"Total rows:  {total_count} (expected {EXPECTED_COUNT})")
+    print(f"Buckets:     {len(bucket_rows)} (expected {EXPECTED_BUCKETS})")
+    print(f"Sum squared: {sum_squared} (expected {EXPECTED_SUM_SQUARED})")
     print(f"Prep time:   {prep_time:.2f}s")
 
-    # Save expected values so the resume phase can verify
-    state = {
-        "total_count": total_count,
-        "bucket_count": len(bucket_rows),
-        "sum_squared": sum_squared,
-        "view_name": "df_survival_test",
-    }
-
-    # Register as a temp view so the resume phase can query by name
-    df.createOrReplaceTempView(state["view_name"])
-
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
-
-    ok = (total_count == 10000 and len(bucket_rows) == 10 and sum_squared == 333383335000)
-    if not ok:
+    if total_count != EXPECTED_COUNT or len(bucket_rows) != EXPECTED_BUCKETS or sum_squared != EXPECTED_SUM_SQUARED:
         print("FAIL: unexpected results during prepare")
-        spark.stop()
-        sys.exit(1)
+        return 1
 
+    df.createOrReplaceTempView(VIEW_NAME)
+    print(f"Temp view '{VIEW_NAME}' created")
+
+    # Print session_id on its own line for easy extraction
+    print(f"SESSION_ID={spark.session_id}")
     print("PASS: DataFrame prepared and cached")
-    # Intentionally do NOT stop the session — it stays open for resume
     return 0
 
 
-def phase_resume(endpoint):
-    """Reconnect and try to reuse the DataFrame after ZeroPod restore."""
-    # Load expected state
+def phase_resume(endpoint, session_id):
+    """Reconnect with the same session_id, query the temp view."""
+    # Spark Connect URL format: sc://host:port/;key=value
+    # The /; separates the path from parameters (parsed via urllib path params)
+    full_endpoint = f"{endpoint}/;session_id={session_id}"
+    print(f"Reconnecting to {full_endpoint}...")
+    print(f"Reusing session_id: {session_id}")
+
+    t0 = time.time()
+    spark = SparkSession.builder.remote(full_endpoint).getOrCreate()
+    connect_time = time.time() - t0
+    print(f"Connected in {connect_time:.2f}s")
+    print(f"Session ID: {spark.session_id}")
+
+    if spark.session_id != session_id:
+        print(f"WARNING: session_id mismatch! expected={session_id}, got={spark.session_id}")
+
+    # Attempt 1: query the temp view
+    print(f"\n--- Querying temp view '{VIEW_NAME}' via same session ---")
     try:
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-    except FileNotFoundError:
-        print("FAIL: no state file — run 'prepare' phase first")
-        sys.exit(1)
-
-    spark = get_session(endpoint)
-    view_name = state["view_name"]
-
-    print(f"\n--- Resuming: querying temp view '{view_name}' ---")
-
-    # Attempt 1: try the temp view (may fail if session state was lost)
-    try:
-        start = time.time()
-        df = spark.sql(f"SELECT * FROM {view_name}")
-        count = df.count()
-        elapsed = time.time() - start
+        t0 = time.time()
+        result_df = spark.sql(f"SELECT * FROM {VIEW_NAME}")
+        count = result_df.count()
+        elapsed = time.time() - t0
         print(f"Temp view query returned {count} rows in {elapsed:.2f}s")
 
-        if count == state["total_count"]:
-            print("PASS: temp view survived checkpoint/restore")
-            spark.stop()
-            return 0
+        if count == EXPECTED_COUNT:
+            sum_sq = result_df.agg(F.sum("squared")).collect()[0][0]
+            if sum_sq == EXPECTED_SUM_SQUARED:
+                print("PASS: Temp view AND data survived checkpoint/restore")
+                print(f"  Session {session_id} preserved across CRIU freeze/thaw")
+                spark.stop()
+                return 0  # full pass
+            else:
+                print(f"FAIL: data corrupted — sum_squared={sum_sq}, expected {EXPECTED_SUM_SQUARED}")
+                spark.stop()
+                return 1
         else:
-            print(f"FAIL: expected {state['total_count']} rows, got {count}")
+            print(f"FAIL: expected {EXPECTED_COUNT} rows, got {count}")
             spark.stop()
             return 1
-    except Exception as e:
-        print(f"Temp view query failed (expected if session state lost): {e}")
 
-    # Attempt 2: rebuild and verify (proves the server is alive post-restore)
-    print("\n--- Fallback: rebuilding DataFrame after restore ---")
+    except Exception as e:
+        elapsed = time.time() - t0
+        print(f"Temp view query failed after {elapsed:.2f}s: {e}")
+
+    # Attempt 2: temp view lost — check if session is at least functional
+    print("\n--- Fallback: rebuilding DataFrame on same session ---")
     try:
-        start = time.time()
-        df = spark.range(1, 10001) \
+        t0 = time.time()
+        df2 = spark.range(1, EXPECTED_COUNT + 1) \
             .withColumn("squared", F.col("id") * F.col("id")) \
             .withColumn("bucket", (F.col("id") % 10).cast("int"))
-        count = df.count()
-        sum_sq = df.agg(F.sum("squared")).collect()[0][0]
-        elapsed = time.time() - start
+        count = df2.count()
+        sum_sq = df2.agg(F.sum("squared")).collect()[0][0]
+        elapsed = time.time() - t0
 
-        print(f"Rebuilt count:       {count} (expected {state['total_count']})")
-        print(f"Rebuilt sum_squared: {sum_sq} (expected {state['sum_squared']})")
+        print(f"Rebuilt count:       {count} (expected {EXPECTED_COUNT})")
+        print(f"Rebuilt sum_squared: {sum_sq} (expected {EXPECTED_SUM_SQUARED})")
         print(f"Rebuild time:        {elapsed:.2f}s")
 
-        if count == state["total_count"] and sum_sq == state["sum_squared"]:
-            print("PARTIAL PASS: temp view lost but server functional after restore")
+        if count == EXPECTED_COUNT and sum_sq == EXPECTED_SUM_SQUARED:
+            print("PARTIAL PASS: temp view lost but same session functional after restore")
             spark.stop()
-            return 2  # exit code 2 = partial pass
+            return 2  # partial pass
         else:
             print("FAIL: rebuilt DataFrame has wrong results")
             spark.stop()
@@ -157,13 +149,21 @@ def phase_resume(endpoint):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in ("prepare", "resume"):
-        print("Usage: test-dataframe-survival.py <prepare|resume> [endpoint]")
+        print("Usage:")
+        print("  test-dataframe-survival.py prepare [endpoint]")
+        print("  test-dataframe-survival.py resume <session_id> [endpoint]")
         sys.exit(1)
 
     phase = sys.argv[1]
-    endpoint = sys.argv[2] if len(sys.argv) > 2 else "sc://localhost:15002"
+    default_endpoint = "sc://spark-connect-server-svc.spark-workload.svc.cluster.local:15002"
 
     if phase == "prepare":
+        endpoint = sys.argv[2] if len(sys.argv) > 2 else default_endpoint
         sys.exit(phase_prepare(endpoint))
     else:
-        sys.exit(phase_resume(endpoint))
+        if len(sys.argv) < 3:
+            print("ERROR: resume requires session_id argument")
+            sys.exit(1)
+        session_id = sys.argv[2]
+        endpoint = sys.argv[3] if len(sys.argv) > 3 else default_endpoint
+        sys.exit(phase_resume(endpoint, session_id))

@@ -1,0 +1,22 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: PLACEHOLDER
+  namespace: spark-workload
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: test
+        image: python:3.12-slim
+        command: ["/bin/sh", "-c"]
+        args: ["PLACEHOLDER"]
+        volumeMounts:
+        - name: test-script
+          mountPath: /opt/test
+      volumes:
+      - name: test-script
+        configMap:
+          name: phase2-test-script
