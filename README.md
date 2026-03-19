@@ -12,111 +12,136 @@ Spark Connect runs a long-lived driver pod (2-8GB RAM) that sits idle between qu
 | KEDA scale 0→1 | 30-60s (cold start) | Zero |
 | **ZeroPod (this POC)** | **~400ms** | **Near-zero (in-place resize built-in)** |
 
+Where it makes sense
+
+Best use cases:
+
+✅ Dev / staging Spark
+
+Not used constantly
+
+Save resources
+
+✅ Interactive workloads
+
+Spark notebooks (Jupyter, Airflow-triggered jobs)
+
+✅ Low-frequency pipelines
+
+Triggered occasionally
+
 ## Architecture
 
+```mermaid
+flowchart TB
+  client[Spark Client<br/>PySpark] -->|gRPC :15002| service[K8s Service<br/>spark-connect-server-svc:15002]
+  service --> driver
+
+  subgraph driver[Driver Pod<br/>runtimeClassName: zeropod]
+    server[Spark Connect Server<br/>JVM, gRPC on :15002]
+    annotations[Annotations<br/>scaledown-duration: 5m<br/>ports-map: driver=15002]
+  end
+
+  subgraph shim[ZeroPod Shim<br/>containerd runtime v2 shim]
+    ebpf[eBPF TCP monitor]
+    activator[Activator<br/>TCP proxy]
+    criu[CRIU]
+  end
+
+  driver --- ebpf
+  driver --- activator
+  driver --- criu
 ```
-                                    Phase 1: Checkpoint/Restore
-                                    ──────────────────────────
 
-  ┌─────────────┐     gRPC :15002     ┌──────────────────────────────────┐
-  │ Spark Client ├───────────────────►│  K8s Service                      │
-  │ (PySpark)   │                     │  spark-connect-server-svc:15002   │
-  └─────────────┘                     └──────────┬───────────────────────┘
-                                                  │
-                                                  ▼
-                                    ┌──────────────────────────────┐
-                                    │  Driver Pod                   │
-                                    │  runtimeClassName: zeropod    │
-                                    │                               │
-                                    │  ┌─────────────────────────┐ │
-                                    │  │ Spark Connect Server    │ │
-                                    │  │ (JVM, gRPC on :15002)   │ │
-                                    │  └─────────────────────────┘ │
-                                    │                               │
-                                    │  Annotations:                 │
-                                    │   scaledown-duration: 5m      │
-                                    │   ports-map: driver=15002     │
-                                    └──────────────┬───────────────┘
-                                                   │
-                              ┌─────────────────────┼─────────────────────┐
-                              │            ZeroPod Shim                    │
-                              │  (containerd runtime v2 shim)             │
-                              │                                           │
-                              │  ┌──────────┐  ┌──────────┐  ┌────────┐ │
-                              │  │ eBPF TCP  │  │Activator │  │ CRIU   │ │
-                              │  │ monitor   │  │(TCP proxy)│  │        │ │
-                              │  └──────────┘  └──────────┘  └────────┘ │
-                              └───────────────────────────────────────────┘
+Idle -> Checkpoint Flow:
 
+```mermaid
+sequenceDiagram
+  participant Port as Port :15002
+  participant Monitor as eBPF monitor
+  participant Criu as CRIU
+  participant Pod as Driver pod
 
-  Idle → Checkpoint Flow:
-  ═══════════════════════
+  Port->>Monitor: No TCP activity for 5 minutes
+  Monitor->>Criu: Trigger checkpoint
+  Criu->>Pod: Freeze JVM process
+  Criu->>Criu: Save memory and process state to disk
+  Pod-->>Port: Container frozen, zero CPU/memory usage
+  Monitor->>Port: Continue watching :15002
+```
 
-  1. No TCP activity on :15002 for 5 minutes
-  2. eBPF monitor triggers checkpoint
-  3. CRIU freezes JVM process → saves memory + state to disk
-  4. Container frozen — zero CPU/memory usage
-  5. eBPF keeps watching port :15002
+Wake -> Restore Flow:
 
-  Wake → Restore Flow:
-  ═════════════════════
+```mermaid
+sequenceDiagram
+  participant Client as New TCP client
+  participant Monitor as eBPF redirect
+  participant Activator as Activator
+  participant Criu as CRIU
+  participant Pod as Restored driver pod
 
-  1. New TCP SYN arrives on :15002
-  2. eBPF redirects connection to Activator (userspace TCP proxy)
-  3. Activator triggers CRIU restore
-  4. JVM resumes — gRPC server back online (~400ms)
-  5. Activator proxies buffered connection to restored container
-  6. eBPF disables redirect — subsequent connections go direct
-  7. Spark processes query normally
+  Client->>Monitor: TCP SYN on :15002
+  Monitor->>Activator: Redirect connection
+  Activator->>Criu: Trigger restore
+  Criu->>Pod: Resume JVM
+  Pod-->>Activator: gRPC server back online in ~400ms
+  Activator->>Pod: Proxy buffered connection
+  Monitor->>Pod: Disable redirect for subsequent connections
+  Pod-->>Client: Process Spark query normally
+```
 
+In-Place Resource Resize:
 
-                                    In-Place Resource Resize
-                                    ────────────────────────
+ZeroPod's --in-place-scaling=true handles resource resize natively
+using KEP-1287 In-Place Pod Vertical Scaling (K8s 1.33+ Beta):
 
-  ZeroPod's --in-place-scaling=true handles resource resize natively
-  using KEP-1287 In-Place Pod Vertical Scaling (K8s 1.33+ Beta):
+```mermaid
+flowchart LR
+  subgraph checkpoint[On checkpoint]
+    cp1[Save original requests as pod annotations]
+    cp2[Resize pod requests to cpu: 1m, memory: 1Ki]
+    cp3[Set label to SCALED_DOWN]
+    cp1 --> cp2 --> cp3
+  end
 
-  On checkpoint:
-    1. Saves original requests as pod annotations
-       (zeropod.ctrox.dev/cpu-requests, zeropod.ctrox.dev/memory-requests)
-    2. Resizes pod requests → {cpu: 1m, memory: 1Ki}
-    3. Sets label: status.zeropod.ctrox.dev/<container>=SCALED_DOWN
+  subgraph restore[On restore]
+    rs1[Read original requests from annotations]
+    rs2[Resize pod requests back to original values]
+    rs3[Set label to RUNNING]
+    rs1 --> rs2 --> rs3
+  end
+```
 
-  On restore:
-    1. Reads original requests from annotations
-    2. Resizes pod requests back to original values
-    3. Sets label: status.zeropod.ctrox.dev/<container>=RUNNING
+Resource timeline:
 
-  Resource timeline:
-  ══════════════════
-
-  Time ──────────────────────────────────────────────────────────►
-
-  Memory   ████████████░░░░░░░░░░░░░░░░░░████████████░░░░░░░░░░░
-  Request  ████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓████████████▓▓▓▓▓▓▓▓▓
-
-           ◄──── active ────►◄── frozen ──►◄── active ──►◄ frozen
-
-  ████ = actual usage (high)     ░░░░ = actual usage (zero)
-  ████ = scheduler request (high) ▓▓▓▓ = scheduler request (near-zero)
+```mermaid
+timeline
+  title Driver Pod Resource State
+  Active : High actual memory usage
+       : High scheduler request
+  Frozen : Zero actual memory usage
+       : Near-zero scheduler request
+  Active : High actual memory usage
+       : High scheduler request
+  Frozen : Zero actual memory usage
+       : Near-zero scheduler request
 ```
 
 ## Executor Lifecycle
 
-```
-  Spark Dynamic Allocation handles executors independently:
+Spark Dynamic Allocation handles executors independently:
 
-  ┌──────────┐  query arrives   ┌──────────┐  idle 60s   ┌──────────┐
-  │ 0 execs  ├─────────────────►│ N execs  ├────────────►│ 0 execs  │
-  │ (scaled  │                  │ (running │              │ (scaled  │
-  │  down)   │◄─────────────────┤  tasks)  │              │  down)   │
-  └──────────┘  executors done  └──────────┘              └──────────┘
-
-  Executors are standard K8s pods — created/destroyed by Spark.
-  ZeroPod only manages the driver pod.
-  When driver is frozen, executors are already gone (idle timeout).
-  When driver restores, new executors are requested on demand.
+```mermaid
+flowchart LR
+  zeroA[0 execs<br/>scaled down] -->|query arrives| many[N execs<br/>running tasks]
+  many -->|idle 60s| zeroB[0 execs<br/>scaled down]
+  many -->|executors done| zeroA
 ```
+
+Executors are standard K8s pods - created and destroyed by Spark.
+ZeroPod only manages the driver pod.
+When driver is frozen, executors are already gone due to idle timeout.
+When driver restores, new executors are requested on demand.
 
 ## Prerequisites
 
